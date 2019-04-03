@@ -49,105 +49,133 @@ import sys
 
 IMPL = None
 
-# Try to use the xattr extension module.
-xattr = None
+# Try to use ctypes (from Python 2.6) for Linux.
+ctypes = None
 if IMPL is None:
   try:
-    import xattr
-    if getattr(xattr, '__version__', '') < '0.2.2':
-      # Earlier versions are buggy, don't use them (rdiff-backup needs 0.2.2).
-      xattr = None
+    import ctypes
   except ImportError:
-    pass
-  if xattr:
-    IMPL = 'xattr'
-    XATTR_ENODATA = getattr(errno, 'ENODATA', -1)
-    XATTR_ENOATTR = getattr(errno, 'ENOATTR', -1)
+    ctypes = None
+  if ctypes:
+    LIBC_CTYPES = ctypes.CDLL('libc.so.6', use_errno=True)
+    for name in ('llistxattr', 'listxattr', 'lgetxattr', 'getxattr'):
+      if not hasattr(LIBC_CTYPES, name):
+        ctypes = LIBC_CTYPES = None
+        break
+  if ctypes:
+    IMPL = 'ctypes'
+    CTYPES_ENOATTR = getattr(errno, 'ENOATTR', -1)  # Not on Linux.
 
     def getxattr(filename, attr_name, do_not_follow_symlinks=False):
-      try:
-        return xattr._xattr.getxattr(
-            filename, attr_name, 0, 0, do_not_follow_symlinks)
-      except IOError, e:
-        if e[0] != XATTR_ENODATA:
-          # We convert the IOError raised by the _xattr module to OSError
-          # expected from us.
-          raise OSError(e[0], e[1])
-        return None
+      if do_not_follow_symlinks:
+        return __getxattr_low(filename, attr_name, LIBC_CTYPES.lgetxattr)
+      else:
+        return __getxattr_low(filename, attr_name, LIBC_CTYPES.getxattr)
 
     def fgetxattr(fd, attr_name):
       if not isinstance(fd, int):
         fd = fd.fileno()
-      try:
-        return xattr._xattr.fgetxattr(fd, attr_name)
-      except IOError, e:
-        if e[0] != XATTR_ENODATA:
-          raise OSError(e[0], e[1])
-        return None
+      return __getxattr_low(fd, attr_name, LIBC_CTYPES.fgetxattr)
+
+    def __getxattr_low(file_id, attr_name, getxattr_func):
+      value = 'x' * 256
+      got = getxattr_func(file_id, attr_name, value, len(value))
+      if got < 0:
+        err = ctypes.get_errno()
+        if err == errno.ENODATA:
+          # The file exists, but doesn't have the specified xattr.
+          return None
+        elif err != errno.ERANGE:
+          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
+        got = getxattr_func(file_id, attr_name, None, 0)
+        if got < 0:
+          err = ctypes.get_errno()
+          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
+        assert got > len(value)
+        value = 'x' * got
+        # We have a race condition here, someone might have changed the xattr
+        # by now.
+        got = getxattr_func(file_id, attr_name, value, got)
+        if got < 0:
+          err = ctypes.get_errno()
+          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
+        return value
+      assert got <= len(value)
+      return value[:got]
 
     def setxattr(filename, attr_name, value, do_not_follow_symlinks=False):
-      try:
-        return xattr._xattr.setxattr(
-            filename, attr_name, value, 0, do_not_follow_symlinks)
-      except IOError, e:
-        raise OSError(e[0], e[1])
+      if do_not_follow_symlinks:
+        return __setxattr_low(filename, attr_name, value, LIBC_CTYPES.lsetxattr)
+      else:
+        return __setxattr_low(filename, attr_name, value, LIBC_CTYPES.setxattr)
 
     def fsetxattr(fd, attr_name, value):
       if not isinstance(fd, int):
         fd = fd.fileno()
-      try:
-        return xattr._xattr.fsetxattr(fd, attr_name, value)
-      except IOError, e:
-        raise OSError(e[0], e[1])
+      return __setxattr_low(fd, attr_name, value, LIBC_CTYPES.fsetxattr)
+
+    def __setxattr_low(file_id, attr_name, value, setxattr_func):
+      value = str(value)
+      got = setxattr_func(file_id, attr_name, value, len(value), 0)
+      if got < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
 
     def removexattr(filename, attr_name, do_not_follow_symlinks=False):
-      try:
-        return xattr._xattr.removexattr(
-            filename, attr_name, do_not_follow_symlinks)
-      except IOError, e:
-        # On some systems, we don't get ENOATTR, but this just succeeds
-        # even if attr_name did not exist.
-        if e[0] != XATTR_ENOATTR:
-          raise OSError(e[0], e[1])
+      if do_not_follow_symlinks:
+        return __removexattr_low(filename, attr_name, LIBC_CTYPES.lremovexattr)
+      else:
+        return __removexattr_low(filename, attr_name, LIBC_CTYPES.removexattr)
 
     def fremovexattr(fd, attr_name):
       if not isinstance(fd, int):
         fd = fd.fileno()
-      try:
-        return xattr._xattr.fremovexattr(fd, attr_name)
-      except IOError, e:
-        if e[0] != XATTR_ENOATTR:
-          raise OSError(e[0], e[1])
+      return __removexattr_low(fd, attr_name, LIBC_CTYPES.fremovexattr)
+
+    def __removexattr_low(file_id, attr_name, removexattr_func):
+      got = removexattr_func(file_id, attr_name)
+      if got < 0:
+        err = ctypes.get_errno()
+        if err != CTYPES_ENOATTR:
+          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
 
     def listxattr(filename, do_not_follow_symlinks=False):
-      # Please note that xattr.listxattr returns a tuple of unicode objects,
-      # so we have to call xattr._xattr.listxattr to get the str objects.
-      try:
-        data = xattr._xattr.listxattr(filename, do_not_follow_symlinks)
-      except IOError, e:
-        raise OSError(e[0], e[1])
-      if data:
-        assert data[-1] == '\0'
-        data = data.split('\0')
-        data.pop()  # Drop last empty string because of the trailing '\0'.
-        return data
+      if do_not_follow_symlinks:
+        return __listxattr_low(filename, LIBC_CTYPES.llistxattr)
       else:
-        return []
+        return __listxattr_low(filename, LIBC_CTYPES.listxattr)
 
     def flistxattr(fd):
       if not isinstance(fd, int):
         fd = fd.fileno()
-      try:
-        data = xattr._xattr.flistxattr(fd)
-      except IOError, e:
-        raise OSError(e[0], e[1])
-      if data:
-        assert data[-1] == '\0'
-        data = data.split('\0')
-        data.pop()  # Drop last empty string because of the trailing '\0'.
-        return data
+      return __listxattr_low(fd, LIBC_CTYPES.flistxattr)
+
+    def __listxattr_low(file_id, listxattr_func):
+      value = 'x' * 256
+      got = listxattr_func(file_id, value, len(value))
+      if got < 0:
+        err = ctypes.get_errno()
+        if err != errno.ERANGE:
+          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
+        got = listxattr_func(file_id, None, 0)
+        if got < 0:
+          err = ctypes.get_errno()
+          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
+        assert got > len(value)
+        value = 'x' * got
+        # We have a race condition here, someone might have changed the xattr
+        # by now.
+        got = listxattr_func(file_id, value, got)
+        if got < 0:
+          err = ctypes.get_errno()
+          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
+      if got:
+        assert got <= len(value)
+        assert value[got - 1] == '\0'
+        return value[:got - 1].split('\0')
       else:
         return []
+
 
 # Try to use dl (Python <=2.4) for Linux i386.
 dl = None
@@ -297,130 +325,105 @@ if IMPL is None:
       else:
         return []
 
-# Try to use ctypes (from Python 2.6) for Linux.
-ctypes = None
+
+# Try to use the xattr extension module.
+# Do this last, because it does 2 syscalls by default.
+xattr = None
 if IMPL is None:
   try:
-    import ctypes
+    import xattr
+    if getattr(xattr, '__version__', '') < '0.2.2':
+      # Earlier versions are buggy, don't use them (rdiff-backup needs 0.2.2).
+      xattr = None
   except ImportError:
-    ctypes = None
-  if ctypes:
-    LIBC_CTYPES = ctypes.CDLL('libc.so.6', use_errno=True)
-    for name in ('llistxattr', 'listxattr', 'lgetxattr', 'getxattr'):
-      if not hasattr(LIBC_CTYPES, name):
-        ctypes = LIBC_CTYPES = None
-        break
-  if ctypes:
-    IMPL = 'ctypes'
-    CTYPES_ENOATTR = getattr(errno, 'ENOATTR', -1)  # Not on Linux.
+    pass
+  if xattr:
+    IMPL = 'xattr'
+    XATTR_ENODATA = getattr(errno, 'ENODATA', -1)
+    XATTR_ENOATTR = getattr(errno, 'ENOATTR', -1)
 
     def getxattr(filename, attr_name, do_not_follow_symlinks=False):
-      if do_not_follow_symlinks:
-        return __getxattr_low(filename, attr_name, LIBC_CTYPES.lgetxattr)
-      else:
-        return __getxattr_low(filename, attr_name, LIBC_CTYPES.getxattr)
+      try:
+        return xattr._xattr.getxattr(
+            filename, attr_name, 0, 0, do_not_follow_symlinks)
+      except IOError, e:
+        if e[0] != XATTR_ENODATA:
+          # We convert the IOError raised by the _xattr module to OSError
+          # expected from us.
+          raise OSError(e[0], e[1])
+        return None
 
     def fgetxattr(fd, attr_name):
       if not isinstance(fd, int):
         fd = fd.fileno()
-      return __getxattr_low(fd, attr_name, LIBC_CTYPES.fgetxattr)
-
-    def __getxattr_low(file_id, attr_name, getxattr_func):
-      value = 'x' * 256
-      got = getxattr_func(file_id, attr_name, value, len(value))
-      if got < 0:
-        err = ctypes.get_errno()
-        if err == errno.ENODATA:
-          # The file exists, but doesn't have the specified xattr.
-          return None
-        elif err != errno.ERANGE:
-          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
-        got = getxattr_func(file_id, attr_name, None, 0)
-        if got < 0:
-          err = ctypes.get_errno()
-          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
-        assert got > len(value)
-        value = 'x' * got
-        # We have a race condition here, someone might have changed the xattr
-        # by now.
-        got = getxattr_func(file_id, attr_name, value, got)
-        if got < 0:
-          err = ctypes.get_errno()
-          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
-        return value
-      assert got <= len(value)
-      return value[:got]
+      try:
+        return xattr._xattr.fgetxattr(fd, attr_name)
+      except IOError, e:
+        if e[0] != XATTR_ENODATA:
+          raise OSError(e[0], e[1])
+        return None
 
     def setxattr(filename, attr_name, value, do_not_follow_symlinks=False):
-      if do_not_follow_symlinks:
-        return __setxattr_low(filename, attr_name, value, LIBC_CTYPES.lsetxattr)
-      else:
-        return __setxattr_low(filename, attr_name, value, LIBC_CTYPES.setxattr)
+      try:
+        return xattr._xattr.setxattr(
+            filename, attr_name, value, 0, do_not_follow_symlinks)
+      except IOError, e:
+        raise OSError(e[0], e[1])
 
     def fsetxattr(fd, attr_name, value):
       if not isinstance(fd, int):
         fd = fd.fileno()
-      return __setxattr_low(fd, attr_name, value, LIBC_CTYPES.fsetxattr)
-
-    def __setxattr_low(file_id, attr_name, value, setxattr_func):
-      value = str(value)
-      got = setxattr_func(file_id, attr_name, value, len(value), 0)
-      if got < 0:
-        err = ctypes.get_errno()
-        raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
+      try:
+        return xattr._xattr.fsetxattr(fd, attr_name, value)
+      except IOError, e:
+        raise OSError(e[0], e[1])
 
     def removexattr(filename, attr_name, do_not_follow_symlinks=False):
-      if do_not_follow_symlinks:
-        return __removexattr_low(filename, attr_name, LIBC_CTYPES.lremovexattr)
-      else:
-        return __removexattr_low(filename, attr_name, LIBC_CTYPES.removexattr)
+      try:
+        return xattr._xattr.removexattr(
+            filename, attr_name, do_not_follow_symlinks)
+      except IOError, e:
+        # On some systems, we don't get ENOATTR, but this just succeeds
+        # even if attr_name did not exist.
+        if e[0] != XATTR_ENOATTR:
+          raise OSError(e[0], e[1])
 
     def fremovexattr(fd, attr_name):
       if not isinstance(fd, int):
         fd = fd.fileno()
-      return __removexattr_low(fd, attr_name, LIBC_CTYPES.fremovexattr)
-
-    def __removexattr_low(file_id, attr_name, removexattr_func):
-      got = removexattr_func(file_id, attr_name)
-      if got < 0:
-        err = ctypes.get_errno()
-        if err != CTYPES_ENOATTR:
-          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
+      try:
+        return xattr._xattr.fremovexattr(fd, attr_name)
+      except IOError, e:
+        if e[0] != XATTR_ENOATTR:
+          raise OSError(e[0], e[1])
 
     def listxattr(filename, do_not_follow_symlinks=False):
-      if do_not_follow_symlinks:
-        return __listxattr_low(filename, LIBC_CTYPES.llistxattr)
+      # Please note that xattr.listxattr returns a tuple of unicode objects,
+      # so we have to call xattr._xattr.listxattr to get the str objects.
+      try:
+        data = xattr._xattr.listxattr(filename, do_not_follow_symlinks)
+      except IOError, e:
+        raise OSError(e[0], e[1])
+      if data:
+        assert data[-1] == '\0'
+        data = data.split('\0')
+        data.pop()  # Drop last empty string because of the trailing '\0'.
+        return data
       else:
-        return __listxattr_low(filename, LIBC_CTYPES.listxattr)
+        return []
 
     def flistxattr(fd):
       if not isinstance(fd, int):
         fd = fd.fileno()
-      return __listxattr_low(fd, LIBC_CTYPES.flistxattr)
-
-    def __listxattr_low(file_id, listxattr_func):
-      value = 'x' * 256
-      got = listxattr_func(file_id, value, len(value))
-      if got < 0:
-        err = ctypes.get_errno()
-        if err != errno.ERANGE:
-          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
-        got = listxattr_func(file_id, None, 0)
-        if got < 0:
-          err = ctypes.get_errno()
-          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
-        assert got > len(value)
-        value = 'x' * got
-        # We have a race condition here, someone might have changed the xattr
-        # by now.
-        got = listxattr_func(file_id, value, got)
-        if got < 0:
-          err = ctypes.get_errno()
-          raise OSError(err, '%s: %r' % (os.strerror(err), file_id))
-      if got:
-        assert got <= len(value)
-        assert value[got - 1] == '\0'
-        return value[:got - 1].split('\0')
+      try:
+        data = xattr._xattr.flistxattr(fd)
+      except IOError, e:
+        raise OSError(e[0], e[1])
+      if data:
+        assert data[-1] == '\0'
+        data = data.split('\0')
+        data.pop()  # Drop last empty string because of the trailing '\0'.
+        return data
       else:
         return []
 
